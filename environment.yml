@@ -1,0 +1,9 @@
+name: flashattn_env
+channels:
+  - conda-forge
+dependencies:
+  - ipykernel
+  - jupyter
+  - python=3.10.19
+  - pytorch
+  - triton
