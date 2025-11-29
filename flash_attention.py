@@ -715,6 +715,40 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
+def naive_runtime(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
+    Q = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    K = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    V = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+
+    softmax_scale = 1 / (HEAD_DIM**0.5)
+    dO = torch.randn_like(Q)
+
+    # reference implementation
+    time_ms = benchmark_naive(Q,K,V,dO,SEQ_LEN,causal,softmax_scale)
+
+    if causal:
+        print(f"[NaiveAttn - Causal]: {time_ms:.3f} ms")
+    else:
+        print(f"[NaiveAttn - NonCausal]: {time_ms: .3f}ms")
+
 def check_runtime(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
     Q = (
         torch.empty(
@@ -748,7 +782,39 @@ def check_runtime(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.
         print(f"[TritonAttn - NonCausal]: {time_ms: .3f}ms")
 
 
-   
+def benchmark_naive(dQ, dK, dV,dO, SEQ_LEN, causal, softmax_scale, iters=20):
+    for _ in range(3):
+        MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+        dP = torch.matmul(dQ, dK.transpose(2, 3)) * softmax_scale
+        if causal:
+            dP[:, :, MASK == 0] = float("-inf")
+        dP = torch.softmax(dP.float(), dim=-1).half()
+        ref_O = torch.matmul(dP, dV)
+        ref_O.backward(dO)
+        dQ.grad.zero_(), dK.grad.zero_(), dV.grad.zero_()
+
+    torch.cuda.synchronize()
+
+    # Timed loop using CUDA events
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+        dP = torch.matmul(dQ, dK.transpose(2, 3)) * softmax_scale
+        if causal:
+            dP[:, :, MASK == 0] = float("-inf")
+        dP = torch.softmax(dP.float(), dim=-1).half()
+        ref_O = torch.matmul(dP, dV)
+        ref_O.backward(dO)
+        dQ.grad.zero_(), dK.grad.zero_(), dV.grad.zero_()
+    end.record()
+
+    torch.cuda.synchronize()
+    total_ms = start.elapsed_time(end)   # GPU-accurate time
+
+    return total_ms / iters
 
 def benchmark_attn(dQ, dK, dV,dO, causal, softmax_scale, iters=20):
     # Warmup (compilation + context)
@@ -777,9 +843,9 @@ def benchmark_attn(dQ, dK, dV,dO, causal, softmax_scale, iters=20):
 
 if __name__ == "__main__":
 
-    check_runtime(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    naive_runtime(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=2048, HEAD_DIM=64, causal=False)
 
-    check_runtime(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
+    naive_runtime(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=2048, HEAD_DIM=64, causal=True)
     # start_time = time.time()
     # test_op(BATCH_SIZE=4, NUM_HEADS=4, SEQ_LEN=128, HEAD_DIM=32, causal=True)
     # end_time = time.time()
